@@ -62,35 +62,31 @@ def main():
         )
 
         print(f"Opening {THEATRE_URL}")
+        # NOTE: THEATRE_URL is expected to already contain the target date
+        # baked into the URL path (BookMyShow's buytickets URLs end in a
+        # YYYYMMDD date segment, e.g. .../buytickets/IPMJ/20260804).
+        # This means the page should load directly showing that date's
+        # listings, with no need to click a date tab. As a safety net, we
+        # still attempt to click a matching date-tab element if one is
+        # found and clickable, but we don't fail if it isn't.
         page.goto(THEATRE_URL, timeout=45000, wait_until="domcontentloaded")
         page.wait_for_timeout(4000)  # let JS render
 
-        # ---- Step 1: try to click the date tab matching TARGET_DAY_NUM ----
-        # BookMyShow date tabs typically render the day number as visible text
-        # (e.g. "01") inside a clickable date-picker element. We search broadly
-        # for any element containing that exact number as its main text and click it.
-        clicked = False
+        # ---- Step 1 (best-effort safety net): try clicking a date tab too ----
         try:
             candidates = page.locator(f"text='{TARGET_DAY_NUM}'")
             count = candidates.count()
-            print(f"Found {count} elements with text '{TARGET_DAY_NUM}'")
-            for i in range(count):
-                el = candidates.nth(i)
+            print(f"Found {count} elements with text '{TARGET_DAY_NUM}' (best-effort click attempt)")
+            if count > 0:
                 try:
-                    el.click(timeout=3000)
-                    clicked = True
-                    print(f"Clicked candidate #{i} for date {TARGET_DAY_NUM}")
-                    break
+                    candidates.first.click(timeout=3000)
+                    print("Clicked a date-tab candidate as extra safety net.")
                 except Exception as e:
-                    print(f"Could not click candidate #{i}: {e}")
+                    print(f"Could not click date tab (not necessarily a problem, URL date should already apply): {e}")
         except Exception as e:
-            print("Date tab click step failed:", e)
+            print("Date tab click step skipped:", e)
 
-        if not clicked:
-            print("WARNING: could not confirm clicking the date tab. "
-                  "Proceeding anyway in case the date is already selected by default.")
-
-        page.wait_for_timeout(3000)  # let showtimes re-render after click
+        page.wait_for_timeout(3000)  # let showtimes re-render if anything changed
 
         # ---- Step 2: find the movie's section and check for showtime elements ----
         page_text = page.inner_text("body")
