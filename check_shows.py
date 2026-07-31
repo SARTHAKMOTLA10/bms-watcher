@@ -100,11 +100,14 @@ def main():
         page.screenshot(path="debug_screenshot.png", full_page=True)
 
         movie_found_in_text = MOVIE_NAME.lower() in page_text.lower()
-        print(f"Movie name appears in page text (secondary check): {movie_found_in_text}")
+        print(f"Movie name appears in page text (informational only, not required): {movie_found_in_text}")
 
         browser.close()
 
-    shows_available = date_stayed_on_target and movie_found_in_text
+    # We rely solely on the date-redirect signal: theatres release all their
+    # movies for a given date together, so if the date didn't redirect back
+    # to today, that theatre's shows (including ours) are live for that date.
+    shows_available = date_stayed_on_target
 
     # ---- Compare to previous state, notify if newly available ----
     already_notified = state.get("found", False)
