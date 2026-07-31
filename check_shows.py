@@ -100,14 +100,34 @@ def main():
         page.screenshot(path="debug_screenshot.png", full_page=True)
 
         movie_found_in_text = MOVIE_NAME.lower() in page_text.lower()
-        print(f"Movie name appears in page text (informational only, not required): {movie_found_in_text}")
+        print(f"Movie name appears in page text (now REQUIRED): {movie_found_in_text}")
+
+        # ---- Detect Cloudflare / bot-detection block pages explicitly ----
+        # If we're blocked, the block page renders at the SAME url we requested
+        # (no redirect happens), which would otherwise look identical to a
+        # genuine "date is live" signal. We must catch this explicitly or
+        # every block will look like a false positive.
+        block_indicators = [
+            "sorry, you have been blocked",
+            "cloudflare ray id",
+            "attention required",
+            "unable to access bookmyshow.com",
+            "performance & security by cloudflare",
+        ]
+        lower_text = page_text.lower()
+        was_blocked = any(indicator in lower_text for indicator in block_indicators)
+        print(f"Blocked by Cloudflare/bot-detection: {was_blocked}")
 
         browser.close()
 
-    # We rely solely on the date-redirect signal: theatres release all their
-    # movies for a given date together, so if the date didn't redirect back
-    # to today, that theatre's shows (including ours) are live for that date.
-    shows_available = date_stayed_on_target
+    if was_blocked:
+        print("Request was blocked by the site's security layer — result is INCONCLUSIVE, "
+              "not treated as available. No alert will be sent this run.")
+        shows_available = False
+    else:
+        # Require BOTH signals: the date didn't redirect back to today, AND
+        # the target movie's name actually appears on the rendered page.
+        shows_available = date_stayed_on_target and movie_found_in_text
 
     # ---- Compare to previous state, notify if newly available ----
     already_notified = state.get("found", False)
