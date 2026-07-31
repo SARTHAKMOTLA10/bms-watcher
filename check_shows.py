@@ -1,31 +1,48 @@
 """
 BookMyShow show-availability watcher.
 
-Checks a specific theatre's page for a specific movie, on a specific date tab.
-If showtimes are now listed (and weren't before), sends a Telegram notification.
+Logic (discovered empirically):
+- BookMyShow's buytickets URL ends in a date segment (YYYYMMDD), e.g.
+  .../buytickets/IPMJ/20260807
+- If that date's bookings are NOT yet released, BookMyShow silently
+  redirects you back to TODAY's date page instead.
+- If that date's bookings ARE released, it stays on the requested date
+  and shows the listings.
 
-State is stored in state.json (committed back to the repo by the GitHub Action)
-so the script remembers whether it already found/alerted, and doesn't spam you
-on every run.
+So the most reliable signal is simply: after loading THEATRE_URL, check
+whether the resulting page URL still contains our requested date, or
+whether it got redirected back to today. If it stayed put, tickets are
+live -> notify. If it got redirected, they're not live yet -> do nothing.
+
+As a secondary confirmation (belt-and-suspenders), we also check that the
+target movie name appears somewhere in the page text.
+
+State is stored in state.json (committed back to the repo by the GitHub
+Action) so the script remembers whether it already alerted, and doesn't
+spam you on every run.
 """
 
 import os
-import sys
-import json
 import re
+import json
 import requests
 from playwright.sync_api import sync_playwright
 
-# ---------- CONFIG (comes from environment variables set in GitHub Actions) ----------
-THEATRE_URL = os.environ["THEATRE_URL"]          # e.g. the buytickets URL for INOX Pacific Mall
+# ---------- CONFIG (from environment variables set in GitHub Actions) ----------
+THEATRE_URL = os.environ["THEATRE_URL"]          # full buytickets URL including target YYYYMMDD date
 MOVIE_NAME = os.environ["MOVIE_NAME"]            # e.g. "Spider-Man: Brand New Day"
-TARGET_DAY_NUM = os.environ["TARGET_DAY_NUM"]    # e.g. "01"  (the day-of-month shown on the date tab)
-TARGET_DAY_LABEL = os.environ.get("TARGET_DAY_LABEL", "")  # optional e.g. "SAT" for extra matching safety
+TARGET_DAY_LABEL = os.environ.get("TARGET_DAY_LABEL", "")  # optional, just for the alert message
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 STATE_FILE = "state.json"
+
+
+def extract_date_segment(url: str):
+    """Pull the trailing 8-digit YYYYMMDD date out of a BookMyShow buytickets URL."""
+    match = re.search(r"(\d{8})(?:[/?#]|$)", url)
+    return match.group(1) if match else None
 
 
 def send_telegram(message: str):
@@ -52,6 +69,9 @@ def save_state(state):
 def main():
     state = load_state()
 
+    requested_date = extract_date_segment(THEATRE_URL)
+    print(f"Requested date segment: {requested_date}")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(
@@ -62,69 +82,38 @@ def main():
         )
 
         print(f"Opening {THEATRE_URL}")
-        # NOTE: THEATRE_URL is expected to already contain the target date
-        # baked into the URL path (BookMyShow's buytickets URLs end in a
-        # YYYYMMDD date segment, e.g. .../buytickets/IPMJ/20260804).
-        # This means the page should load directly showing that date's
-        # listings, with no need to click a date tab. As a safety net, we
-        # still attempt to click a matching date-tab element if one is
-        # found and clickable, but we don't fail if it isn't.
         page.goto(THEATRE_URL, timeout=45000, wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)  # let JS render
+        page.wait_for_timeout(4000)  # let JS render / redirect settle
 
-        # ---- Step 1 (best-effort safety net): try clicking a date tab too ----
-        try:
-            candidates = page.locator(f"text='{TARGET_DAY_NUM}'")
-            count = candidates.count()
-            print(f"Found {count} elements with text '{TARGET_DAY_NUM}' (best-effort click attempt)")
-            if count > 0:
-                try:
-                    candidates.first.click(timeout=3000)
-                    print("Clicked a date-tab candidate as extra safety net.")
-                except Exception as e:
-                    print(f"Could not click date tab (not necessarily a problem, URL date should already apply): {e}")
-        except Exception as e:
-            print("Date tab click step skipped:", e)
+        final_url = page.url
+        final_date = extract_date_segment(final_url)
+        print(f"Final URL after load: {final_url}")
+        print(f"Final date segment: {final_date}")
 
-        page.wait_for_timeout(3000)  # let showtimes re-render if anything changed
+        date_stayed_on_target = (requested_date is not None and final_date == requested_date)
+        print(f"Date stayed on target (main signal): {date_stayed_on_target}")
 
-        # ---- Step 2: find the movie's section and check for showtime elements ----
+        # ---- Secondary confirmation: is the movie name present on the page? ----
         page_text = page.inner_text("body")
-
-        # Save full text for debugging (uploaded as a GitHub Actions artifact)
         with open("debug_page_text.txt", "w", encoding="utf-8") as f:
             f.write(page_text)
-
         page.screenshot(path="debug_screenshot.png", full_page=True)
 
         movie_found_in_text = MOVIE_NAME.lower() in page_text.lower()
-        print(f"Movie name appears in page text: {movie_found_in_text}")
-
-        shows_available = False
-
-        if movie_found_in_text:
-            # Try to isolate the block of text right after the movie name and
-            # look for time-like patterns (e.g. "07:50 AM", "11:20 PM") near it.
-            idx = page_text.lower().find(MOVIE_NAME.lower())
-            # Look at a window of text after the movie name (next ~800 characters,
-            # roughly covers that movie's showtime rows before the next movie title)
-            window = page_text[idx: idx + 800]
-            time_pattern = re.compile(r"\b\d{1,2}:\d{2}\s?(AM|PM)\b", re.IGNORECASE)
-            matches = time_pattern.findall(window)
-            print(f"Time-like matches found near movie name: {len(matches)}")
-            if matches:
-                shows_available = True
+        print(f"Movie name appears in page text (secondary check): {movie_found_in_text}")
 
         browser.close()
 
-    # ---- Step 3: compare to previous state, notify if newly available ----
+    shows_available = date_stayed_on_target and movie_found_in_text
+
+    # ---- Compare to previous state, notify if newly available ----
     already_notified = state.get("found", False)
 
     if shows_available and not already_notified:
         msg = (
             f"🎬 Tickets are now LIVE!\n\n"
             f"Movie: {MOVIE_NAME}\n"
-            f"Date tab: {TARGET_DAY_LABEL} {TARGET_DAY_NUM}\n"
+            f"Date: {TARGET_DAY_LABEL} ({requested_date})\n"
             f"Book now: {THEATRE_URL}"
         )
         print("New shows detected — sending Telegram alert.")
@@ -134,9 +123,8 @@ def main():
     elif shows_available and already_notified:
         print("Shows available, but already notified previously — skipping duplicate alert.")
     else:
-        print("No shows found yet for target date/movie.")
-        # If it previously said "found" but now doesn't (e.g. date rolled over),
-        # you could reset state here manually between runs/weeks.
+        print("No shows found yet for target date/movie (page redirected back to today, "
+              "or movie name not found).")
 
     print("Done.")
 
